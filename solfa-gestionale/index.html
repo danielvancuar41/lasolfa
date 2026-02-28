@@ -1896,8 +1896,9 @@ document.querySelectorAll('.modal-overlay').forEach(o => {
 // ============================================================
 // BARCODE SCANNER
 // ============================================================
-let codeReader = null;
 let scannerAttivo = false;
+let scannerStream = null;
+let scannerAnimFrame = null;
 
 async function apriScanner() {
   const overlay = document.getElementById('scanner-modal-overlay');
@@ -1905,61 +1906,109 @@ async function apriScanner() {
   setStatoScanner('Avvio fotocamera…', '');
 
   try {
-    if (!window.ZXing) {
-      setStatoScanner('Libreria scanner non disponibile', 'error');
-      return;
-    }
-
-    // Apri la fotocamera direttamente con getUserMedia (posteriore)
-    const stream = await navigator.mediaDevices.getUserMedia({
+    scannerStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
     });
 
     const video = document.getElementById('scanner-video');
-    video.srcObject = stream;
+    video.srcObject = scannerStream;
+    video.setAttribute('playsinline', true);
     await video.play();
 
     scannerAttivo = true;
-    codeReader = new ZXing.BrowserMultiFormatReader();
-    setStatoScanner('Punta la fotocamera sul codice a barre…', '');
+    setStatoScanner('Punta sul codice a barre…', '');
 
-    // Leggi frame dal video
-    leggiFrame(video);
+    // Aspetta che il video sia pronto poi inizia a leggere
+    video.addEventListener('loadedmetadata', () => {
+      leggiBarcode(video);
+    }, { once: true });
+
+    // fallback se loadedmetadata è già fired
+    if (video.readyState >= 2) leggiBarcode(video);
 
   } catch (e) {
-    setStatoScanner('Errore fotocamera: ' + e.message, 'error');
+    if (e.name === 'NotAllowedError') {
+      setStatoScanner('Permesso fotocamera negato — abilitalo nelle impostazioni', 'error');
+    } else {
+      setStatoScanner('Errore: ' + e.message, 'error');
+    }
   }
 }
 
-function leggiFrame(video) {
+function leggiBarcode(video) {
   if (!scannerAttivo) return;
-  try {
-    codeReader.decodeFromVideoElement(video).then(async result => {
-      if (!scannerAttivo) return;
-      const codice = result.getText();
-      setStatoScanner(`Codice: ${codice} — Ricerca…`, 'success');
-      scannerAttivo = false;
-      await cercaProdottoDaBarcode(codice);
-    }).catch(() => {
-      // riprova ogni 300ms
-      if (scannerAttivo) setTimeout(() => leggiFrame(video), 300);
-    });
-  } catch(e) {
-    if (scannerAttivo) setTimeout(() => leggiFrame(video), 300);
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+
+  // Crea il codeReader ZXing una volta sola
+  const hints = new Map();
+  const formats = [
+    ZXing.BarcodeFormat.EAN_13,
+    ZXing.BarcodeFormat.EAN_8,
+    ZXing.BarcodeFormat.CODE_128,
+    ZXing.BarcodeFormat.CODE_39,
+    ZXing.BarcodeFormat.UPC_A,
+    ZXing.BarcodeFormat.UPC_E,
+    ZXing.BarcodeFormat.ITF,
+    ZXing.BarcodeFormat.DATA_MATRIX,
+    ZXing.BarcodeFormat.QR_CODE,
+  ];
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+  const reader = new ZXing.MultiFormatReader();
+  reader.setHints(hints);
+
+  let tentativo = 0;
+
+  function scanFrame() {
+    if (!scannerAttivo) return;
+
+    if (video.readyState !== video.HAVE_ENOUGH_DATA) {
+      scannerAnimFrame = requestAnimationFrame(scanFrame);
+      return;
+    }
+
+    canvas.width  = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    try {
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const luminance = new ZXing.RGBLuminanceSource(imageData.data, canvas.width, canvas.height);
+      const binaryBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+      const result = reader.decode(binaryBitmap);
+
+      if (result) {
+        const codice = result.getText();
+        scannerAttivo = false;
+        setStatoScanner(`✅ Codice: ${codice} — Ricerca…`, 'success');
+        cercaProdottoDaBarcode(codice);
+        return;
+      }
+    } catch(e) {
+      // NotFoundException normale — riprova
+    }
+
+    tentativo++;
+    if (tentativo % 30 === 0) {
+      // ogni ~1 sec aggiorna status con animazione
+      const dots = '.'.repeat((tentativo / 30) % 4);
+      setStatoScanner(`Scansione in corso${dots}`, '');
+    }
+
+    scannerAnimFrame = requestAnimationFrame(scanFrame);
   }
+
+  scannerAnimFrame = requestAnimationFrame(scanFrame);
 }
 
 function chiudiScanner() {
   scannerAttivo = false;
+  if (scannerAnimFrame) { cancelAnimationFrame(scannerAnimFrame); scannerAnimFrame = null; }
+  if (scannerStream) { scannerStream.getTracks().forEach(t => t.stop()); scannerStream = null; }
   const video = document.getElementById('scanner-video');
-  if (video && video.srcObject) {
-    video.srcObject.getTracks().forEach(t => t.stop());
-    video.srcObject = null;
-  }
-  if (codeReader) {
-    try { codeReader.reset(); } catch(e) {}
-    codeReader = null;
-  }
+  if (video) { video.srcObject = null; }
   document.getElementById('scanner-modal-overlay').classList.remove('open');
 }
 
@@ -1977,9 +2026,9 @@ async function cercaProdottoDaBarcode(codice) {
 
     if (data.status === 1 && data.product) {
       const p = data.product;
-      const nome = p.product_name_it || p.product_name || p.generic_name_it || p.generic_name || '';
+      const nome  = p.product_name_it || p.product_name || p.generic_name_it || p.generic_name || '';
       const brand = p.brands || '';
-      const nomeCompleto = nome.trim() ? (brand ? `${nome} ${brand}`.trim() : nome.trim()) : brand.trim();
+      const nomeCompleto = nome.trim() ? nome.trim() : brand.trim();
 
       if (nomeCompleto) {
         document.getElementById('qa-prodotto-text').value = nomeCompleto;
@@ -1988,8 +2037,8 @@ async function cercaProdottoDaBarcode(codice) {
           document.getElementById('qa-prezzo').value = prodCatalogo.prezzoStima;
         }
         setStatoScanner(`✅ ${nomeCompleto}`, 'success');
+        showToast(`Trovato: ${nomeCompleto}`);
         setTimeout(() => chiudiScanner(), 1400);
-        showToast(`Prodotto trovato: ${nomeCompleto}`);
       } else {
         setStatoScanner('Prodotto senza nome — inserisci manualmente', 'error');
         setTimeout(() => chiudiScanner(), 2000);
@@ -2006,13 +2055,13 @@ async function cercaProdottoDaBarcode(codice) {
 
 function mappaCategoriaOFF(tags) {
   const t = tags.join(' ').toLowerCase();
-  if (t.includes('dairy') || t.includes('latte') || t.includes('formagg') || t.includes('burro') || t.includes('panna')) return 'Latticini';
-  if (t.includes('meat') || t.includes('carne') || t.includes('salumi') || t.includes('prosciutto')) return 'Carni';
-  if (t.includes('pasta') || t.includes('farin') || t.includes('bread') || t.includes('pane')) return 'Farine & Pasta';
+  if (t.includes('dairy') || t.includes('latte') || t.includes('formagg')) return 'Latticini';
+  if (t.includes('meat') || t.includes('carne') || t.includes('salumi')) return 'Carni';
+  if (t.includes('pasta') || t.includes('farin')) return 'Farine & Pasta';
   if (t.includes('oil') || t.includes('olio')) return 'Grassi & Oli';
   if (t.includes('conserv') || t.includes('tomato') || t.includes('pomodor')) return 'Conserve';
-  if (t.includes('spice') || t.includes('spezie') || t.includes('salt') || t.includes('pepe')) return 'Spezie & Condimenti';
-  if (t.includes('sweet') || t.includes('dolc') || t.includes('sugar') || t.includes('zuccher')) return 'Dolciumi';
+  if (t.includes('spice') || t.includes('spezie') || t.includes('salt')) return 'Spezie & Condimenti';
+  if (t.includes('sweet') || t.includes('dolc') || t.includes('sugar')) return 'Dolciumi';
   return 'Altro';
 }
 function showToast(msg) {
